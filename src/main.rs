@@ -1,8 +1,9 @@
 use aes::{
 	cipher::generic_array::{typenum, GenericArray},
-	Aes128, BlockCipher, NewBlockCipher,
+	Aes128,
 };
 use async_std::io::{self, Stdin};
+use block_modes::{block_padding::NoPadding, BlockMode, Cbc};
 use futures::executor::block_on;
 use num_cpus;
 use rayon::prelude::*;
@@ -12,18 +13,25 @@ use std::{
 	io::{BufReader, Read},
 };
 
+type Aes128Cbc = Cbc<Aes128, NoPadding>;
+
 fn main() -> io::Result<()> {
 	// Handle program arguments
 	let args: Vec<String> = env::args().collect();
 	if args.len() < 3 {
-		println!("args: <file_path> <known_plaintext (hex)> [<num_threads = 4> <output_bad_attempts = false>]");
+		println!("args: <file_path> <known_plaintext (hex)> [<iv = 0x00 * 16> <num_threads = 4> <output_bad_attempts = false>]");
 		return Ok(());
 	}
 	let file_path = &args[1];
 	let known_plaintext = parse_hex(&args[2]);
+	let iv = if args.len() >= 4 {
+		parse_16_hex(&args[3])
+	} else {
+		[0u8; 16]
+	};
 	let cpu_threads = num_cpus::get();
-	let mut num_threads = if args.len() >= 4 {
-		args[3].parse::<usize>().unwrap()
+	let mut num_threads = if args.len() >= 5 {
+		args[4].parse::<usize>().unwrap()
 	} else {
 		4
 	};
@@ -31,7 +39,7 @@ fn main() -> io::Result<()> {
 		num_threads = cpu_threads;
 	}
 	let output_bad_attempts =
-		args.len() >= 5 && args[4].to_lowercase().chars().next().unwrap() == 't';
+		args.len() >= 6 && args[5].to_lowercase().chars().next().unwrap() == 't';
 
 	// Set maximum threads to use
 	rayon::ThreadPoolBuilder::new()
@@ -59,11 +67,7 @@ fn main() -> io::Result<()> {
 		.find_any(|line| -> bool {
 			match line {
 				Ok(key) => {
-					let res = check_key(
-						&GenericArray::from(parse_key_hex(key)),
-						&file_blocks,
-						&known_plaintext,
-					);
+					let res = check_key(&parse_16_hex(key), &iv, &file_blocks, &known_plaintext);
 					if res {
 						println!("Found: {}", key);
 					} else if output_bad_attempts {
@@ -79,13 +83,16 @@ fn main() -> io::Result<()> {
 }
 
 fn check_key(
-	key: &GenericArray<u8, typenum::U16>,
+	key: &[u8; 16],
+	iv: &[u8; 16],
 	file_blocks: &Vec<GenericArray<u8, typenum::U16>>,
 	known_plaintext: &Vec<u8>,
 ) -> bool {
-	let cipher = Aes128::new(key);
+	let cipher = Aes128Cbc::new_var(key, iv).unwrap();
 	let mut block = file_blocks[0].clone();
-	cipher.decrypt_block(&mut block);
+	cipher
+		.decrypt(&mut block)
+		.expect("An error occurred while decrypting the first block.");
 	let mut i = 0;
 	for b in known_plaintext {
 		if *b != block[i] {
@@ -151,7 +158,7 @@ fn parse_hex(hex_asm: &str) -> Vec<u8> {
 	bytes
 }
 
-fn parse_key_hex(hex_asm: &str) -> [u8; 16] {
+fn parse_16_hex(hex_asm: &str) -> [u8; 16] {
 	let mut hex_bytes = hex_asm
 		.as_bytes()
 		.iter()
